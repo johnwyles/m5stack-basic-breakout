@@ -131,6 +131,10 @@ struct Ball {
     // Bricks touched since this ball last hit the paddle. Reset by a paddle
     // bounce and by a serve, not by walls or by the safety net.
     uint8_t combo;
+
+    // Signed spin. Positive curves the ball one way, negative the other.
+    // Zeroed on serve and on a sticky-paddle catch.
+    float   spin;
 };
 
 struct Paddle {

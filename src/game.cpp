@@ -38,6 +38,7 @@ struct GameCtx {
 
     float     baseSpeed;          // difficulty * level scaling
     float     speedMul;           // slow/fast powerups
+    float     paddleVel;          // MEASURED px/tick, after clamping
     uint16_t  stickyTicks;
     uint16_t  bigTicks;           // BIG BALL
     uint16_t  explosiveTicks;     // every brick the ball touches detonates
@@ -129,6 +130,33 @@ static void setSpeedMul(float mul) {
 }
 
 static inline bool explosiveActive() { return g.explosiveTicks > 0; }
+
+// ---------------------------------------------------------------------------
+// Magnus: curve the flight without changing its speed.
+//
+// The renormalise is not optional. Spin must alter DIRECTION only; if it added
+// energy the ball would creep past BALL_SPEED_CAP and start tunnelling through
+// bricks between frames, quietly breaking a guarantee the whole collision
+// system rests on.
+// ---------------------------------------------------------------------------
+static void applySpin(Ball& b) {
+    if (b.stuck) return;
+
+    if (fabsf(b.spin) <= SPIN_MIN) { b.spin = 0.0f; return; }
+
+    float sp = sqrtf(b.vx * b.vx + b.vy * b.vy);
+    if (sp > 0.01f) {
+        float px = -b.vy / sp;          // perpendicular to travel, normalised
+        float py =  b.vx / sp;
+
+        b.vx += px * SPIN_MAGNUS * b.spin;
+        b.vy += py * SPIN_MAGNUS * b.spin;
+
+        float ns = sqrtf(b.vx * b.vx + b.vy * b.vy);
+        if (ns > 0.01f) { b.vx *= sp / ns; b.vy *= sp / ns; }
+    }
+    b.spin *= SPIN_DECAY;
+}
 
 static void clearBarrier();   // defined with applyBarrier, used by the reset paths
 
@@ -401,6 +429,7 @@ static void serveBall() {
     b.trailHead   = 0;
     b.trailCount  = 0;
     b.combo       = 0;
+    b.spin        = 0.0f;
     b.x = g.paddle.x + g.paddle.w * 0.5f - g.ballSize * 0.5f;
     b.y = PADDLE_Y - g.ballSize;
 
@@ -679,6 +708,10 @@ static void resolveBricks(Ball& b, bool horizontal) {
         else                                                    b.y  = bestEdge;
         b.vy = -b.vy;
     }
+
+    // Contact reverses the sense of the spin and damps it, which also stops a
+    // ball settling into a permanent orbit.
+    b.spin *= SPIN_BOUNCE_RETAIN;
 }
 
 // ---------------------------------------------------------------------------
@@ -707,12 +740,26 @@ static void updatePaddle() {
     }
     g.paddle.dir = dir;
 
+    // Measured, not intended. Holding left while already pinned against the
+    // wall means the paddle is NOT moving and must impart no spin; using
+    // dir * speed here would give phantom English off both walls, in exactly
+    // the situation the player is least able to explain.
+    float prev = g.paddle.x;
     g.paddle.x = clampf(g.paddle.x + dir * g.paddle.speed,
                         0.0f, (float)(PLAY_W - g.paddle.w));
+    g.paddleVel = g.paddle.x - prev;
 }
 
 static void ballVsPaddle(Ball& b) {
     if (b.vy <= 0) return;
+
+    // Captured BEFORE anything overwrites it. The outgoing vx is computed from
+    // the impact position further down, and slip was being measured against
+    // that instead of against the ball's real incoming motion. It made a
+    // centre hit produce exactly zero slip by construction, because a centre
+    // hit has an outgoing vx of zero, which removed the natural spin a still
+    // paddle is supposed to impart and gutted the whole model.
+    float inVx = b.vx;
     if (!overlaps(b.x, b.y, g.ballSize, g.ballSize,
                   g.paddle.x, (float)PADDLE_Y, (float)g.paddle.w, (float)PADDLE_H)) return;
 
@@ -743,6 +790,7 @@ static void ballVsPaddle(Ball& b) {
         b.stuck       = true;
         b.stickOffset = (b.x + g.ballSize * 0.5f) - (g.paddle.x + g.paddle.w * 0.5f);
         b.vx = b.vy   = 0.0f;
+        b.spin        = 0.0f;
         sfx_paddle();
         return;
     }
@@ -751,17 +799,65 @@ static void ballVsPaddle(Ball& b) {
     // renormalised every time so long rallies never drift faster or slower.
     float half = g.paddle.w * 0.5f;
     float t    = clampf(((b.x + g.ballSize * 0.5f) - (g.paddle.x + half)) / half, -1.0f, 1.0f);
-    float ang  = t * (PI / 3.0f);            // up to +/- 60 degrees
+    float ang  = t * (PI / 3.0f);            // up to +/- 60 degrees from position
     float sp   = currentSpeed();
 
+    // Spin carried INTO the hit bends the departure angle. This is what makes
+    // spin worth setting up: you load the ball on one bounce and cash it in on
+    // the next, rather than spin being something that merely happens to you.
+    ang += clampf(b.spin, -SPIN_MAX, SPIN_MAX) * SPIN_CARRY;
+    ang  = clampf(ang, -PADDLE_ANG_MAX, PADDLE_ANG_MAX);
+
+    // Most of the charge is spent turning the ball. Without this a loaded ball
+    // would keep its spin through every bounce forever.
+    b.spin *= SPIN_CARRY_CONSUME;
+
     b.vx = sp * sinf(ang);
-    b.vy = -sp * cosf(ang);
+
+    // Tangential slip at the contact point, from the ball's INCOMING motion.
+    // A paddle chasing the ball at matching speed leaves near-zero slip and
+    // bounces clean; a paddle driven INTO the direction the ball came from
+    // leaves large slip and bites hard; a still paddle leaves the ball's own
+    // incoming vx, which is the mild natural amount.
+    float slip = inVx - g.paddleVel;
+
+    // Friction drags the ball toward the paddle's direction of travel, and the
+    // same slip loads the spin that will curve the flight.
+    // Both terms take the SAME sign off slip, and that sign is negative.
+    //
+    // This was the third and worst of the bugs. Friction kicked the ball toward
+    // the paddle's direction of travel while the spin term, being positive,
+    // curved it back the other way. The kick and the curve spent the whole
+    // flight cancelling each other, which is precisely why the path looked
+    // straight no matter how hard the constants were pushed. They now reinforce.
+    b.vx  -= SPIN_FRICTION * slip;
+    b.spin = clampf(b.spin - SPIN_GAIN * slip, -SPIN_MAX, SPIN_MAX);
+
+    // Aiming by impact position stays the dominant skill, so friction is capped
+    // well short of flattening the bounce. It also keeps vy large enough that
+    // the anti-stall floor never has to fight it.
+    b.vx = clampf(b.vx, -sp * SPIN_MAX_VX_FRAC, sp * SPIN_MAX_VX_FRAC);
+    b.vy = -sqrtf(fmaxf(sp * sp - b.vx * b.vx, 0.04f));
+    if (fabsf(b.vy) < BALL_VY_FLOOR) b.vy = -BALL_VY_FLOOR;
+
+#if SPIN_DEBUG
+    // One line per paddle hit. Two rounds of blind tuning is enough: this says
+    // whether the spin is actually being generated, separately from whether it
+    // is visible once it is.
+    {
+        float sp2  = sqrtf(b.vx * b.vx + b.vy * b.vy);
+        float degT = (sp2 > 0.01f)
+                   ? (SPIN_MAGNUS * fabsf(b.spin) / sp2) * 57.2958f : 0.0f;
+        Serial.printf("[spin] inVx %+5.2f padVel %+5.2f slip %+5.2f -> spin %+5.2f "
+                      "| outVx %+5.2f ang %+5.1fdeg | curve %.2f deg/tick\n",
+                      inVx, g.paddleVel, slip, b.spin,
+                      b.vx, ang * 57.2958f, degT);
+    }
+#endif
+
     sfx_paddle();
 }
 
-// ---------------------------------------------------------------------------
-// Powerups
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // ARMOR: every brick that was one hit from dying becomes two. Legible instantly
 // now that bricks print their remaining hits, which is what makes this work as
@@ -1222,6 +1318,12 @@ static void tickPlaying() {
             fx_popup(b.x, (float)(NET_Y - 16), "SAVED", DROPS[PU_NET].color);
         }
 
+        // Spin curves the flight first; the anti-stall floor below then gets
+        // the FINAL word on vy. Reversed, a strong curve would drive vy toward
+        // zero and the floor would shove it back every tick, which shows up as
+        // visible jitter rather than as a curve.
+        applySpin(b);
+
         // Anti-stall: a near-horizontal ball skimming the top of the play area
         // can rally forever without ever threatening a brick.
         if (!b.stuck && fabsf(b.vy) < BALL_VY_FLOOR) {
@@ -1412,6 +1514,19 @@ static void drawBallTrail(M5Canvas& cv, const Ball& b, uint16_t base) {
 
     float heat = fireHeat(b);
 
+    // Wake: push each sample sideways in proportion to spin and age, so the
+    // tail streams off to one side. The orbiting dot is illegible below 6px,
+    // which left the 4px default ball with no cue at all except the curve
+    // itself; this one reads at any size.
+    float wx = 0.0f, wy = 0.0f;
+    if (fabsf(b.spin) > SPIN_MIN) {
+        float sp = sqrtf(b.vx * b.vx + b.vy * b.vy);
+        if (sp > 0.01f) {
+            wx = ( b.vy / sp) * b.spin * SPIN_WAKE_PX;
+            wy = (-b.vx / sp) * b.spin * SPIN_WAKE_PX;
+        }
+    }
+
     // Oldest sample first so newer, brighter ones land on top.
     for (uint8_t k = (uint8_t)(b.trailCount - 1); k >= 1; --k) {
         uint8_t idx = (uint8_t)((b.trailHead + BALL_TRAIL_LEN - k) % BALL_TRAIL_LEN);
@@ -1440,8 +1555,11 @@ static void drawBallTrail(M5Canvas& cv, const Ball& b, uint16_t base) {
             jx = (int16_t)((int32_t)((g.frameTick * 7 + idx * 13) % 3) - 1);
         }
 
-        cv.fillRect((int16_t)b.trailX[idx] + (g.ballSize - sz) / 2 + jx,
-                    (int16_t)b.trailY[idx] + (g.ballSize - sz) / 2,
+        // Age-weighted so the wake fans out behind rather than shifting whole.
+        float f = (float)(age + 1) / (float)BALL_TRAIL_LEN;
+
+        cv.fillRect((int16_t)(b.trailX[idx] + wx * f) + (g.ballSize - sz) / 2 + jx,
+                    (int16_t)(b.trailY[idx] + wy * f) + (g.ballSize - sz) / 2,
                     sz, sz, col);
     }
 }
@@ -1562,6 +1680,17 @@ static void renderPlay() {
             cv.fillRoundRect((int16_t)b.x, (int16_t)b.y, g.ballSize, g.ballSize, 2, bc);
         } else {
             cv.fillRect((int16_t)b.x, (int16_t)b.y, g.ballSize, g.ballSize, bc);
+        }
+
+        // Spin indicator: a single pixel orbiting at a rate set by the spin, so
+        // you can see which way the ball is loaded BEFORE it curves. Only drawn
+        // on a fat ball; at the 4px default it is noise rather than signal.
+        if (g.ballSize >= SPIN_DOT_MIN_BALL && fabsf(b.spin) > SPIN_MIN) {
+            float  r  = g.ballSize * 0.5f - 1.0f;
+            float  a  = (float)g.frameTick * b.spin * 0.22f;
+            int16_t cx = (int16_t)(b.x + g.ballSize * 0.5f + cosf(a) * r);
+            int16_t cy = (int16_t)(b.y + g.ballSize * 0.5f + sinf(a) * r);
+            cv.fillRect(cx, cy, 2, 2, COL_BG);
         }
     }
 

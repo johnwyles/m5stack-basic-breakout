@@ -217,6 +217,102 @@ static constexpr uint8_t  COMBO_CHEER_MIN = 4;    // chain worth announcing at t
 static constexpr uint8_t LEVEL_COUNT = 10;
 static constexpr uint8_t MAX_LIVES   = 9;
 
+// Set to 1 to print one line per paddle hit: incoming vx, paddle velocity,
+// slip, resulting spin and degrees of curve per tick. Turn this on before
+// changing any value below, so tuning is measurement rather than guesswork.
+#define SPIN_DEBUG 1
+
+// ---------------------------------------------------------------------------
+// Ball spin  --  THE TUNING BLOCK. Everything about how spin feels is here.
+//
+// The model is tangential SLIP at contact, not "paddle direction":
+//
+//     slip = ball.vx - paddleVelocity
+//
+// which gives the behaviour asked for without special-casing anything. Paddle
+// chasing the ball at matching speed leaves near-zero slip and a clean bounce.
+// Paddle driving INTO the direction the ball came from gives large slip, heavy
+// spin and heavy deflection. A stationary paddle leaves slip equal to the
+// ball's own vx, so a mild natural amount.
+//
+// Paddle velocity is MEASURED from the position delta after clamping, never
+// from dir * speed. Holding left while already pinned against the wall means
+// the paddle is not moving and must impart nothing; intended velocity would
+// give phantom English off the walls.
+//
+// Spin changes DIRECTION ONLY. The speed is renormalised immediately after the
+// Magnus step, because a spin that adds energy would push the ball past
+// BALL_SPEED_CAP and straight through bricks between frames.
+// ---------------------------------------------------------------------------
+
+// Fraction of slip converted to immediate sideways deflection on the bounce.
+// This is the "struck with momentum" feel: a paddle sweeping through the ball
+// visibly throws it sideways, separate from the curve that follows. At 0.12 it
+// added 0.8 px/tick against a +/-60 degree range set by impact position, so it
+// read as noise. Too high and it overrides aiming, which is the primary skill.
+// v1 shipped at 0.12 / 0.12 / 0.985 / 0.018 / -0.45 and the curve was
+// essentially invisible in play. Two causes, and the second was the real error:
+//
+//   Decay alone left 30% of the spin after a single traversal, AND
+//   SPIN_BOUNCE_RETAIN at -0.45 cut it to 45% on EVERY brick or wall contact.
+//   Two contacts put you at 20%, three at 9%. In real play the ball is hitting
+//   something constantly, so a max-slip hit deviated 30px on a clean run and
+//   only 11px while working through bricks. On a 4px ball that is under three
+//   ball widths spread over the whole playfield.
+//
+// v2 raises everything except FRICTION. Friction is the one competing with
+// aiming by impact position, and aiming stays the primary skill.
+static constexpr float SPIN_FRICTION = 0.20f;
+
+// Slip -> stored spin. With paddle speed up to 5 and ball vx a few px/tick,
+// slip peaks near 7-9, so 0.12 puts a hard counter-move close to SPIN_MAX.
+static constexpr float SPIN_GAIN = 0.14f;
+static constexpr float SPIN_MAX  = 1.00f;
+
+// Per-tick decay. 0.985 is roughly a 46-tick half-life, so a curve lasts about
+// a second and a half rather than forever.
+static constexpr float SPIN_DECAY = 0.990f;
+static constexpr float SPIN_MIN   = 0.02f;     // below this, just zero it
+
+// Magnus strength: lateral acceleration per unit spin, per tick. This is the
+// one that sets how bent the flight looks, and the first value to reach for.
+// At v2 settings a max-slip hit deviates about 64px on a clean traversal and
+// 25px while working through bricks. Pushed to 0.045 with retention at -0.80
+// it reaches 110px, which is a banana rather than a curve; this is close to
+// the ceiling before it stops feeling aimable.
+static constexpr float SPIN_MAGNUS = 0.050f;
+
+// Walls and bricks flip the sense of the spin and damp it. Negative on purpose.
+static constexpr float SPIN_BOUNCE_RETAIN = -0.70f;
+
+// Never let spin eat so much of the velocity that the ball goes flat; the
+// anti-stall floor would then fight it every tick and visibly jitter.
+static constexpr float SPIN_MAX_VX_FRAC = 0.92f;
+
+// The spin indicator is a single orbiting pixel. Only legible on a fat ball, so
+// it appears with BIG BALL and stays off at the 4px default where it is noise.
+static constexpr int16_t SPIN_DOT_MIN_BALL = 6;
+
+// The orbiting dot is illegible below 6px, so at the 4px default the only cue
+// was the curve itself. The wake fixes that: trail samples are offset sideways
+// in proportion to spin and age, so the tail streams off to one side. Reads at
+// any ball size and reinforces the arc already on screen.
+static constexpr float SPIN_WAKE_PX = 3.2f;
+
+// Spin carried INTO a paddle hit bends the outgoing angle, so spin becomes
+// something you set up and then cash in rather than something that merely
+// happens to you. Radians of deflection per unit spin.
+static constexpr float SPIN_CARRY = 0.30f;
+
+// How much spin survives being cashed in. Most of it is spent turning the
+// ball; without this a loaded ball would keep its charge forever.
+static constexpr float SPIN_CARRY_CONSUME = 0.30f;
+
+// Hard ceiling on the outgoing paddle angle once position and carry are summed.
+// 60 degrees from position plus 17 from carry would leave vy barely above
+// BALL_VY_FLOOR, and the anti-stall floor would then fight every bounce.
+static constexpr float PADDLE_ANG_MAX = 1.22f;     // 70 degrees
+
 // ---------------------------------------------------------------------------
 // Effects
 // ---------------------------------------------------------------------------

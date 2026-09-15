@@ -294,6 +294,95 @@ Growth expands each ball about its own centre, which can leave it overlapping a 
 
 Up to 4 balls. You lose a life only when the **last** ball drains, not the first. Splitting a held ball gives the clones a fresh upward vector rather than cloning a zero velocity.
 
+### Ball spin
+
+The model is tangential **slip** at contact, not "paddle direction":
+
+```
+slip = ball.vx - paddleVelocity
+```
+
+That one number gives the whole behaviour without special-casing anything. A paddle chasing the ball at matching speed leaves near-zero slip and bounces clean. A paddle driven *into* the direction the ball came from leaves large slip, and bites hard. A stationary paddle leaves the ball's own vx, a mild natural amount.
+
+Slip does two things: friction drags the ball toward the paddle's direction of travel immediately, and the same slip loads a persistent per-ball spin that curves the flight via a Magnus force perpendicular to velocity.
+
+Spin carried **into** a paddle hit bends the departure angle, so it is something you set up on one bounce and cash in on the next rather than something that merely happens to you. Most of the charge is spent doing so, or a loaded ball would keep it forever. Position on the paddle still dominates; carry is a modifier.
+
+Three things this gets right that are easy to get wrong:
+
+- **Paddle velocity is measured, not intended.** It comes from the position delta after clamping, never from `dir * speed`. Holding left while already pinned against the wall means the paddle is not moving and must impart nothing; intended velocity would give phantom English off both walls, in exactly the situation the player is least able to explain.
+- **Spin changes direction only.** Speed is renormalised immediately after the Magnus step. A spin that added energy would creep the ball past `BALL_SPEED_CAP` and start tunnelling through bricks between frames, quietly breaking a guarantee the whole collision system rests on.
+- **The anti-stall floor gets the last word.** Spin is applied before it, and the outgoing paddle angle is capped at 70 degrees. Reversed or uncapped, a strong curve would drive `vy` toward zero and the floor would shove it back every tick, showing up as jitter rather than as a curve.
+
+#### Three bugs that made v1 and v2 look like nothing
+
+**Slip was measured from the outgoing velocity.** `ballVsPaddle` writes `b.vx` from the impact position, then slip was computed against that. So slip meant "where you hit, versus paddle velocity" rather than "ball going one way, paddle going the other", and a centre hit with a still paddle produced exactly zero slip by construction. The incoming vx is captured before anything overwrites it now.
+
+**The tuning was done against a distance the ball never travels.** The simulations assumed a 200px traversal. The paddle sits at y=204 and the lowest brick bottom at y=132, so free flight before the first contact is about 72px, roughly 28 ticks. Every deviation figure from those rounds was about 3x optimistic, which is why nudging constants never helped: the basis was wrong, not the value.
+
+**The kick and the curve were cancelling each other.** The worst of the three. Friction kicked the ball toward the paddle's direction of travel while the spin term, taking the opposite sign off the same slip, curved it back. The two spent the whole flight fighting, so the path came out nearly straight no matter how hard the constants were pushed. Both terms take the same sign now and reinforce.
+
+Deflection over the real 72px hop, ball arriving at vx +1.8:
+
+| paddle | kick | curve on top | total |
+|---|---|---|---|
+| still | 10px | 5px | 15px |
+| 2 px/tick into the ball | 21px | 9px | 30px |
+| 5 px/tick into the ball | 38px | 13px | 51px |
+| 5 px/tick with the ball | 18px | 8px | 26px |
+
+#### Tuning
+
+Everything lives in one block in `config.h` marked THE TUNING BLOCK.
+
+| Constant | v1 | v2 | v3 | What it does |
+|---|---|---|---|---|
+| `SPIN_MAGNUS` | 0.018 | 0.030 | **0.090** | How bent the flight looks |
+| `SPIN_FRICTION` | 0.12 | 0.12 | **0.20** | Immediate sideways throw off a sweeping paddle |
+| `SPIN_BOUNCE_RETAIN` | -0.45 | -0.70 | -0.70 | Spin kept and flipped on wall/brick contact |
+| `SPIN_DECAY` | 0.985 | 0.990 | 0.990 | How long a curve lasts |
+| `SPIN_GAIN` | 0.12 | 0.14 | 0.14 | Slip into stored spin |
+| `SPIN_CARRY` | - | 0.30 | 0.30 | Radians of departure bend per unit incoming spin |
+| `SPIN_CARRY_CONSUME` | - | 0.30 | 0.30 | Spin left after being cashed in |
+| `SPIN_WAKE_PX` | - | 3.2 | 3.2 | Lateral sway of the trail at full spin |
+
+Two rounds of tuning failed before the actual causes were found, and neither was the value of a constant.
+
+**Slip was read from the wrong velocity.** `ballVsPaddle()` computed the outgoing `vx` from the impact position, then measured slip against *that* rather than against the ball's incoming motion. Since a centre hit produces an outgoing `vx` of exactly zero, a centre hit with a stationary paddle produced exactly zero slip by construction, removing the natural spin a still paddle is meant to impart. The incoming velocity is now captured at the top of the function before anything overwrites it.
+
+**The tuning was measured against a distance the ball never travels.** Both earlier rounds modelled a 200px traversal. The paddle sits at y=204 and the lowest brick bottom is at y=132, so the free flight before the ball strikes something is **72px**, about 28 ticks. Every deviation figure quoted in v1 and v2 was roughly 3x optimistic, which is exactly why raising the constant twice changed nothing perceptible.
+
+Measured over the real 72px hop, centre hit, ball arriving at vx +1.8:
+
+| Paddle | slip | spin | instant angle | curve |
+|---|---|---|---|---|
+| still | 1.80 | 0.25 | 8° | 8px |
+| sweeping 2.5 px/tick | 4.30 | 0.60 | 20° | 20px |
+| sweeping 5.0 px/tick | 6.80 | 0.95 | 33° | 30px |
+| moving with the ball | -3.20 | -0.45 | 15° | 15px |
+
+For comparison, v2 on a centre hit with a still paddle produced 0° and 0px, and with a full sweep produced 14° and under 8px of curve.
+
+The risk case is a long clean run late in a level once the bottom rows are gone, where the ball does get its 200px and will bend hard. `SPIN_DECAY` is the knob for that.
+
+#### Measuring rather than guessing
+
+`#define SPIN_DEBUG 1` at the top of the tuning block prints one line per paddle hit:
+
+```
+[spin] inVx +1.80 padVel -5.00 slip +6.80 -> spin +0.95 | outVx -1.36 ang -33.0deg | curve 1.96 deg/tick
+```
+
+That separates "is spin being generated" from "is it visible once it is", which is the distinction two rounds of blind tuning could not make.
+
+#### Seeing it
+
+The trail sweeps sideways in proportion to spin and age, so the wake streams off one side of the arc. The sampled positions already contain the true curve, but on a 4px ball that curve is too small to read, which is the other half of why v1 seemed to do nothing.
+
+A single pixel also orbits the ball at a rate set by the spin, showing which way it is loaded before it curves. That one is only drawn at 6px and up, so it appears with BIG BALL and stays off at the default size where it would be noise.
+
+Spin zeroes on serve and on a sticky-paddle catch.
+
 ### Rally combo
 
 Every brick a ball touches without returning to the paddle raises that ball's chain, and each brick in the chain scores 10% more than base. Non-fatal hits on armoured bricks count too: the chain measures work done on the grid, not kills.
